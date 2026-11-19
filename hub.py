@@ -908,7 +908,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- plumbing
     @property
     def proxied(self):
-        return "X-Forwarded-For" in self.headers or "X-Real-IP" in self.headers
+        h = getattr(self, "headers", None)   # missing when the request line itself couldn't be parsed
+        return h is not None and ("X-Forwarded-For" in h or "X-Real-IP" in h)
 
     @property
     def ip(self):
