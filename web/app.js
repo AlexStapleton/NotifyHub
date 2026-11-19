@@ -100,6 +100,7 @@ async function overview() {
       stat("ntfy", d.ntfy_ok ? "reachable" : "DOWN", d.ntfy_ok ? "ok" : "bad"),
       stat("Diun (update checks)", d.diun, d.diun === "running" ? "ok" : "bad"),
       stat("Containers running", d.containers + (d.unhealthy.length ? ` · ${d.unhealthy.length} unhealthy` : ""), d.unhealthy.length ? "warn" : "ok"),
+      stat("Updates available", String(d.available), d.available ? "warn" : "ok"),
       stat("Waiting for approval", String(d.pending), d.pending ? "warn" : null),
       stat("Quiet hours", d.quiet.enabled ? `${d.quiet.start}–${d.quiet.end}${d.quiet_now ? " (now)" : ""}` : "off", d.quiet_now ? "warn" : null),
       stat("Uptime", `${days} d ${hrs} h`)),
@@ -130,7 +131,21 @@ async function updates() {
   const policySel = (cur, onchange, withDefault) => el("select", { onchange },
     withDefault ? el("option", { value: "", selected: !cur }, `Default: ${POLICY_TEXT[c.default_policy]}`) : null,
     Object.entries(POLICY_TEXT).map(([k, v]) => el("option", { value: k, selected: cur === k }, v)));
+  const updateNow = async (name, btn) => {
+    if (!confirm(`Update ${name} now? It restarts if a newer image exists.`)) return;
+    if (btn) btn.disabled = true;
+    const x = await api("/api/update-now", { container: name }); toast(x.message);
+  };
   show(
+    el("div", { class: "row spread" }, el("h2", {}, "Out of date"),
+      el("div", { class: "row" }, el("span", { class: "muted small" }, "Last checked " + ago(c.checked)),
+        el("button", { class: "ghost sm", onclick: async (e) => { e.target.disabled = true; const r = await api("/api/check-updates", {}); toast(r.message); } }, "Check now"))),
+    el("div", { class: "card" }, c.available.length ? el("ul", { class: "feed" }, c.available.map(a => el("li", {}, el("span", { class: "p p4" }),
+      el("div", { class: "row spread" },
+        el("div", {}, el("div", { class: "t" }, a.name), el("div", { class: "m" }, `newer image available: ${a.image}`)),
+        a.compose ? el("button", { onclick: (e) => updateNow(a.name, e.target) }, "Update now")
+                  : el("span", { class: "muted small" }, "not from a compose file - update by hand")))))
+      : el("p", { class: "muted" }, c.checked ? "Everything is up to date." : "Not checked yet - press Check now.")),
     el("h2", {}, "Waiting for your approval"),
     el("div", { class: "card" }, pend.length ? el("ul", { class: "feed" }, pend.map(p => el("li", {}, el("span", { class: "p p4" }),
       el("div", { class: "row spread" },
@@ -149,11 +164,12 @@ async function updates() {
         el("td", {}, el("div", {}, r.name), el("div", { class: "muted small" }, r.image)),
         el("td", { class: "small" }, r.version),
         el("td", {}, el("span", { class: "chip " + (r.state !== "running" ? "" : r.health === "unhealthy" ? "bad" : "ok") }, r.state === "running" ? (r.health || "running") : r.state),
-          r.pending ? el("span", { class: "chip warn" }, " update waiting") : null),
+          r.update_available ? el("span", { class: "chip warn" }, " update available") : null,
+          r.pending ? el("span", { class: "chip warn" }, " waiting for approval") : null),
         el("td", {}, policySel(r.policy, async (e) => { await api("/api/policy", { container: r.name, policy: e.target.value || null }); toast("Saved"); }, true),
           r.last_update ? el("div", { class: "muted small" }, `last: ${r.last_update.ok ? "updated" : "failed"} ${ago(r.last_update.ts)}`) : null),
         el("td", {}, el("button", { class: "ghost sm", disabled: !r.compose || r.state !== "running", title: r.compose ? "Pull the newest image and recreate" : "Not started from a compose file",
-          onclick: async (e) => { if (!confirm(`Update ${r.name} now? It restarts if a newer image exists.`)) return; e.target.disabled = true; const x = await api("/api/update-now", { container: r.name }); toast(x.message); } }, "Update now")))))),
+          onclick: (e) => updateNow(r.name, e.target) }, "Update now")))))),
     el("h2", {}, "Update history"), el("div", { class: "card" }, updatesTable(hist)));
 }
 

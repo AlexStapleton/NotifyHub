@@ -55,6 +55,7 @@ HEALTH_WAIT = int(os.environ.get("HUB_HEALTH_WAIT", "300"))
 STABLE_FOR = int(os.environ.get("HUB_STABLE_FOR", "30"))
 NTFY_RETRIES = int(os.environ.get("HUB_NTFY_RETRIES", "20"))
 TICK = int(os.environ.get("HUB_TICK", "30"))
+RECONCILE_EVERY = int(os.environ.get("HUB_RECONCILE_EVERY", str(6 * 3600)))  # compare running images with Diun's DB
 
 CONFIG_FILE = os.path.join(HUB_DIR, "config.json")
 SECRET_FILE = os.path.join(HUB_DIR, "diun.secret")
@@ -507,6 +508,8 @@ def do_updates(names, mode):
                 ok, msg, old, new = False, f"{n}: internal error: {e}", "", ""
             x("insert into updates(ts,container,old,new,ok,mode,detail) values(?,?,?,?,?,?,?)",
               (time.time(), n, old, new, int(ok), mode, msg))
+            if ok:
+                forget_available(n)
             results.append((ok, msg))
         good = all(ok for ok, _ in results)
         title = ("Updated" if good else "Update FAILED") + ": " + ", ".join(names)
@@ -531,11 +534,21 @@ def handle_diun(p):
         notify("Update seen, nothing to do", f"Diun reports a new image for {image}, but no running container uses it.",
                2, ["information_source"], view, source="updates")
         return
+    announce(image, sorted(names), view, p.get("digest"))
+
+
+def announce(image, names, view=None, digest=None):
+    """Act on 'a newer image exists' for these containers, per their policy (auto / ask / notify / ignore)."""
     pol = load_config()["policies"]
     groups = {k: [] for k in POLICIES}
     for n in sorted(names):
         p = pol.get(n) or pol.get("*", "ask")
         groups[p if p in POLICIES else "ask"].append(n)
+    if digest:   # remember what was announced, so the periodic catch-up doesn't repeat it
+        ann = kv_get("announced", {})
+        ann.update({n: digest for n in names})
+        kv_set("announced", ann)
+    view = view or []
     if groups["auto"]:
         threading.Thread(target=guard(do_updates), args=(groups["auto"], "auto"), daemon=True).start()
 
@@ -573,7 +586,102 @@ def guard(fn):
         except Exception as e:
             traceback.print_exc()
             notify("NotifyHub error", f"{getattr(fn, '__name__', 'task')}: {e}", 4, ["warning"])
+    wrapped.__name__ = getattr(fn, "__name__", "task")
     return wrapped
+
+
+# ------------------------------------------------------------ update tracking (Diun's database vs what runs)
+def diun_latest(ref):
+    """Newest digest Diun has seen in the registry for this image:tag (no registry call of our own)."""
+    n = norm(ref)
+    tag = n.rsplit(":", 1)[1]
+    rc, out, _ = run(["docker", "exec", "diun", "diun", "image", "inspect", "--image", n, "--raw"], timeout=30)
+    if rc:
+        return None
+    try:
+        for m in json.loads(out).get("image", {}).get("manifests", []):
+            if m.get("tag") == tag:
+                return m.get("digest")
+    except ValueError:
+        pass
+    return None
+
+
+def find_outdated():
+    """Running containers whose image is older than the newest one Diun saw.
+    Returns [{"name", "image", "latest", "compose"}]. Locally built images (no registry digest) are skipped."""
+    cs = containers()
+    ids = sorted({c["Image"] for c in cs})
+    local = {}
+    if ids:
+        rc, out, _ = run(["docker", "image", "inspect"] + ids, timeout=60)
+        try:
+            for img in json.loads(out) if not rc else []:
+                local[img["Id"]] = {d.split("@", 1)[1] for d in (img.get("RepoDigests") or []) if "@" in d}
+        except ValueError:
+            pass
+    latest, found = {}, []
+    for c in cs:
+        mine = local.get(c["Image"])
+        if not mine:
+            continue
+        ref = norm(c["Config"]["Image"])
+        if ref not in latest:
+            latest[ref] = diun_latest(ref)
+        if latest[ref] and latest[ref] not in mine:
+            found.append({"name": cname(c), "image": ref, "latest": latest[ref], "compose": compose_info(c) is not None})
+    return found
+
+
+_reconcile_lock = threading.Lock()
+
+
+def reconcile(manual=False):
+    """Record what's out of date (shown in the UI) and announce it. The periodic run only announces digests
+    not announced before; a manual check re-announces everything that's still behind."""
+    if not _reconcile_lock.acquire(blocking=False):
+        return
+    try:
+        found = find_outdated()
+        kv_set("available", {"ts": time.time(), "items": found})
+        ann = kv_get("announced", {})
+        pending = {n for r in q("select containers from pending") for n in json.loads(r["containers"])}
+        by_image = {}
+        for f in found:
+            if f["name"] in pending and not manual:
+                continue
+            if not manual and ann.get(f["name"]) == f["latest"]:
+                continue
+            by_image.setdefault((f["image"], f["latest"]), []).append(f["name"])
+        for (image, digest), names in by_image.items():
+            announce(image, names, None, digest)
+        log(f"update check: {len(found)} out of date, announced {sum(len(v) for v in by_image.values())}"
+            + (" (manual)" if manual else ""))
+        kv_set("last_reconcile", time.time())
+    finally:
+        _reconcile_lock.release()
+
+
+def check_now():
+    """'Check for updates now': let Diun re-check the registries, wait for it, then reconcile."""
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rc, _, err = run(["docker", "restart", "diun"], timeout=60)
+    if rc:
+        raise RuntimeError("couldn't restart Diun: " + tail(err))
+    end = time.time() + 180
+    while time.time() < end:
+        time.sleep(3)
+        rc, out, err = run(["docker", "logs", "--since", since, "diun"], timeout=20)
+        if "Jobs completed" in (out + err):
+            break
+    reconcile(manual=True)
+
+
+def forget_available(name):
+    av = kv_get("available")
+    if av:
+        av["items"] = [i for i in av["items"] if i["name"] != name]
+        kv_set("available", av)
 
 
 def diun_schedule(new=None):
@@ -822,6 +930,9 @@ def scheduler():
             x("delete from notifications where ts < ?", (now - cfg.get("history_days", 90) * 86400,))
             x("delete from pending where ts < ?", (now - cfg.get("pending_ttl_days", 14) * 86400,))
             x("delete from sessions where last < ? or created < ?", (now - SESSION_IDLE, now - SESSION_MAX))
+            if now - (kv_get("last_reconcile") or 0) > RECONCILE_EVERY:   # catch updates whose notice was missed
+                kv_set("last_reconcile", now)
+                threading.Thread(target=guard(reconcile), daemon=True).start()
             for it in items(cfg):
                 if not it["enabled"] or it.get("error"):
                     continue
@@ -1237,6 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
                 "diun": s["diun"], "diun_schedule": diun_schedule(),
                 "containers": s["containers"], "unhealthy": s["unhealthy"],
                 "pending": len(q("select token from pending")), "held": len(q("select nid from held")),
+                "available": len((kv_get("available") or {}).get("items", [])),
                 "quiet": cfg["quiet"], "quiet_now": quiet_now(cfg),
                 "recent": q("select * from notifications order by id desc limit 15"),
                 "updates": q("select * from updates order by id desc limit 5"),
@@ -1261,8 +1373,13 @@ class Handler(BaseHTTPRequestHandler):
                             "state": c["State"].get("Status"), "health": (c["State"].get("Health") or {}).get("Status"),
                             "policy": pol.get(n), "default_policy": pol.get("*", "ask"),
                             "compose": compose_info(c) is not None, "last_update": last.get(n), "pending": pend.get(n)})
-            out.sort(key=lambda r: (r["state"] != "running", r["name"]))
-            return self.send_json(200, {"containers": out, "default_policy": pol.get("*", "ask")})
+            av = kv_get("available") or {"ts": None, "items": []}
+            avail = {i["name"] for i in av["items"]}
+            for r in out:
+                r["update_available"] = r["name"] in avail
+            out.sort(key=lambda r: (r["state"] != "running", not r["update_available"], r["name"]))
+            return self.send_json(200, {"containers": out, "default_policy": pol.get("*", "ask"),
+                                        "checked": av["ts"], "available": av["items"]})
         if path == "/api/pending":
             return self.send_json(200, [{"token": r["token"], "containers": json.loads(r["containers"]), "image": r["image"], "ts": r["ts"]}
                                         for r in q("select * from pending order by ts desc")])
@@ -1324,10 +1441,11 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=guard(do_updates), args=(json.loads(rows[0]["containers"]), "approved"), daemon=True).start()
             return self.send_json(200, {"ok": True})
         if path == "/api/check-updates":
-            rc, _, err = run(["docker", "restart", "diun"], timeout=60)
-            if rc:
-                raise ValueError("couldn't restart Diun: " + tail(err))
-            return self.send_json(200, {"ok": True, "message": "Diun is checking all images now; anything new arrives as a notification."})
+            if not inspect("diun"):
+                raise ValueError("Diun isn't running, so there's nothing to check with")
+            threading.Thread(target=guard(check_now), daemon=True).start()
+            return self.send_json(202, {"ok": True, "message": "Checking all images (about a minute). Everything out of date "
+                                                               "shows on the Updates page and is announced again."})
         if path == "/api/items/save":
             kind, name = d.get("kind"), str(d.get("name", ""))
             it = next((i for i in items(cfg) if i["kind"] == kind and i["name"] == name), None)
