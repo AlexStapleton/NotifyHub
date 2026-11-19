@@ -737,6 +737,7 @@ def items(cfg=None):
 def run_item(kind, name, send=True):
     """Run one report/check now. Returns {'title','message','priority','tags'} or None, plus an error text."""
     res, err = None, None
+    t0, c0 = time.time(), sum(os.times()[:4])
     try:
         it = next((i for i in items() if i["kind"] == kind and i["name"] == name), None)
         if not it:
@@ -755,7 +756,9 @@ def run_item(kind, name, send=True):
     except Exception as e:
         traceback.print_exc()
         err = f"{type(e).__name__}: {e}"
-    kv_set(f"result:{kind}:{name}", {"ts": time.time(), "error": err,
+    took, cpu = time.time() - t0, sum(os.times()[:4]) - c0   # cpu includes programs it started (approximate if others run at once)
+    log(f"{kind} {name}: {took:.1f} s, ~{cpu:.1f} s CPU" + (f", error: {err}" if err else ""))
+    kv_set(f"result:{kind}:{name}", {"ts": time.time(), "error": err, "took": round(took, 1), "cpu": round(cpu, 1),
                                       "title": (res or {}).get("title"), "message": (res or {}).get("message")})
     if send and res:
         notify(res.get("title", name), res.get("message", ""), res.get("priority", 3), res.get("tags"),
