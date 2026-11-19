@@ -29,22 +29,26 @@ def run(ctx, s):
         health = (state.get("Health") or {}).get("Status")
         rec = st.get(n, {"bad_since": None, "alerted": False, "restarts": c.get("RestartCount", 0), "running": False})
         problem = None
+        restarted = c.get("RestartCount", 0) - rec.get("restarts", 0)   # restarts since the last check (<0 = recreated)
+        code = state.get("ExitCode", 0)
+        stopped_on_purpose = code in (0, 137, 143)   # clean exit, or docker stop (SIGTERM=143 / SIGKILL=137)
         if state.get("Status") == "running" and health == "unhealthy":
             rec["bad_since"] = rec["bad_since"] or now
             if now - rec["bad_since"] >= float(s.get("unhealthy_minutes") or 10) * 60:
                 problem = f"{n} has been unhealthy for {int((now - rec['bad_since']) / 60)} min"
-        elif state.get("Restarting") or c.get("RestartCount", 0) - rec.get("restarts", 0) >= int(s.get("restarts") or 3):
+        elif state.get("Restarting") or restarted >= int(s.get("restarts") or 3):
             rec["bad_since"] = rec["bad_since"] or now
-            problem = f"{n} keeps restarting (exit code {state.get('ExitCode')})"
-        elif state.get("Status") == "exited" and rec.get("running") and state.get("ExitCode", 0) != 0:
+            problem = f"{n} keeps restarting (exit code {code})"
+        elif state.get("Status") == "exited" and rec.get("running") and not stopped_on_purpose:
             rec["bad_since"] = rec["bad_since"] or now
-            problem = f"{n} crashed (exit code {state.get('ExitCode')}) and is down"
-        elif state.get("Status") == "running" and health in (None, "healthy"):
+            problem = f"{n} crashed (exit code {code}) and is down"
+        elif state.get("Status") == "running" and health in (None, "healthy") and restarted <= 0:
+            # only "recovered" once it went a whole check without restarting
             if rec.get("alerted"):
                 recovered.append(f"{n} is running{' and healthy' if health else ''} again")
             rec["bad_since"], rec["alerted"] = None, False
-        elif state.get("Status") == "exited" and rec.get("alerted") and state.get("ExitCode", 0) == 0:
-            rec["bad_since"], rec["alerted"] = None, False   # stopped on purpose
+        elif state.get("Status") == "exited" and rec.get("alerted") and stopped_on_purpose:
+            rec["bad_since"], rec["alerted"] = None, False
         if problem and not rec["alerted"] and not first_run:
             alerts.append(problem)
             rec["alerted"] = True

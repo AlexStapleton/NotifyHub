@@ -46,7 +46,8 @@ const POLICY_TEXT = { auto: "Auto-update", ask: "Ask me (button)", notify: "Just
 // ---------------------------------------------------------------- login + one-time update pages
 if ($("form.login")) {
   const e = new URLSearchParams(location.search).get("e");
-  if (e) { const p = $("#err"); p.hidden = false; p.textContent = e === "locked" ? "Too many failed attempts. Try again in 15 minutes." : "Wrong username, password or code."; }
+  if (e) { const p = $("#err"); p.hidden = false; p.textContent = e === "locked" ? "Too many failed attempts. Try again in 15 minutes."
+    : e === "busy" ? "Too many sign-ins at once. Try again in a moment." : "Wrong username, password or code."; }
 }
 if ($("#upd")) {
   $("#go").addEventListener("click", async () => {
@@ -65,8 +66,12 @@ async function route() {
   const page = (location.hash || "#overview").slice(1).split("?")[0];
   document.querySelectorAll("#tabs a").forEach(a => a.classList.toggle("on", a.getAttribute("href") === "#" + page));
   clearInterval(refreshTimer);
-  try { await (pages[page] || overview)(); }
+  refreshTimer = null;
+  const fn = pages[page] || overview;
+  try { await fn(); }
   catch (e) { show(el("p", { class: "err" }, e.message)); }
+  // Only the overview auto-refreshes: exactly one timer, and only while the tab is visible.
+  if (fn === overview) refreshTimer = setInterval(() => { if (!document.hidden) overview().catch(() => {}); }, 30000);
 }
 window.addEventListener("hashchange", route);
 route();
@@ -109,7 +114,6 @@ async function overview() {
       el("tr", {}, el("td", {}, "Diun image check"), el("td", {}, d.diun_schedule ? "cron " + d.diun_schedule : "?"), el("td", {})))),
     el("h2", {}, "Recent notifications"), el("div", { class: "card" }, feed(d.recent)),
     el("h2", {}, "Recent updates"), el("div", { class: "card" }, updatesTable(d.updates)));
-  refreshTimer = setInterval(() => { if (location.hash === "#overview" || !location.hash) overview().catch(() => {}); }, 30000);
 }
 
 function updatesTable(rows) {

@@ -55,7 +55,7 @@ To update, `git pull` and run `sudo ./install.sh` again. Settings, history and t
 | `/home/notify/hub/` | the code; `config.json` holds settings edited in the UI |
 | `/home/notify/notify.conf` | ntfy server, topic, optional token (shared with the `notify` command) |
 | `/var/lib/notify-hub/` | `hub.db` (history, sessions), `auth.json` (login), backups of replaced files |
-| `/etc/default/notify-hub` | site settings: `HUB_LAN_URL`, `HUB_DIUN_YML`, `HUB_PORT` |
+| `/etc/default/notify-hub` | site settings: `HUB_LAN_URL`, `HUB_DIUN_YML`, `HUB_PORT`, `HUB_TRUSTED_PROXIES` |
 | `/usr/local/bin/notify-hub` | admin command |
 | `/usr/local/bin/notify` | send a notification from any script |
 
@@ -98,7 +98,9 @@ def run(ctx, settings):
 
 ## Putting it on the internet
 
-Put it behind a reverse proxy with HTTPS, e.g. Nginx Proxy Manager or Caddy, pointing at `http://<server>:8099`. Then set **Settings → Public hub address**, so the **Update** buttons work from anywhere. The proxy must send `X-Forwarded-For`/`X-Real-IP` and `X-Forwarded-Proto`; NPM and Caddy do this by default.
+Put it behind a reverse proxy with HTTPS, e.g. Nginx Proxy Manager or Caddy, pointing at `http://<server>:8099`. Then set **Settings → Public hub address**, so the **Update** buttons work from anywhere. The proxy must send `X-Real-IP` and `X-Forwarded-Proto`; NPM and Caddy do this by default.
+
+The hub only believes `X-Real-IP` from a proxy running on the same server (e.g. NPM with `network_mode: host`). If your proxy runs elsewhere, or in a Docker bridge network, add its address or subnet to `HUB_TRUSTED_PROXIES` in `/etc/default/notify-hub`, e.g. `HUB_TRUSTED_PROXIES=172.18.0.0/16`. A proxy in a Docker bridge network also hides IPv6 visitors' real addresses; running it on the host network avoids that.
 
 How it protects itself:
 
@@ -106,8 +108,9 @@ How it protects itself:
   - no default password
   - scrypt password hashing
   - optional TOTP
-  - 5 failed logins per IP (or 25 in total) within 15 minutes lock out further tries
-  - a notification on every login from outside your LAN
+  - 5 failed logins from one IP within 15 minutes block that IP. 25 failures from internet addresses block internet logins only, so bots can't lock you out at home.
+  - at most 2 password checks run at once, so a burst of logins can't exhaust memory or CPU
+  - a notification on every login from outside your home network (your own IPv6 range counts as home)
 - **Sessions:** HttpOnly, SameSite=Lax (so links from other pages keep you signed in), and Secure behind HTTPS cookies. They expire after 7 days idle or 30 days at most.
 - **Requests:**
   - Every change needs a custom request header, so other sites can't trigger actions.

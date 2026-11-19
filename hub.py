@@ -25,8 +25,10 @@ import importlib.util
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -34,6 +36,7 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
@@ -45,6 +48,7 @@ PORT = int(os.environ.get("HUB_PORT", "8099"))
 NOTIFY_CONF = os.environ.get("NOTIFY_CONF", "/home/notify/notify.conf")
 DIUN_YML = os.environ.get("HUB_DIUN_YML", "")          # Diun's config file, so the UI can change its schedule
 LAN_URL = os.environ.get("HUB_LAN_URL", "")            # used in Update buttons when no public URL is set
+TRUSTED_PROXIES = [p.strip() for p in os.environ.get("HUB_TRUSTED_PROXIES", "").split(",") if p.strip()]  # + this server
 OLD_POLICY = os.environ.get("HUB_OLD_POLICY", "/home/notify/update-approver/policy.conf")  # legacy import
 TITLE_PREFIX = os.environ.get("HUB_TITLE_PREFIX", "")
 HEALTH_WAIT = int(os.environ.get("HUB_HEALTH_WAIT", "300"))
@@ -206,7 +210,6 @@ def prio(p):
 
 def primary_ip():
     """The server's LAN address (no traffic is sent; this only asks the kernel which source IP it would use)."""
-    import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("192.0.2.1", 9))
@@ -230,13 +233,16 @@ def quiet_now(cfg=None):
     try:
         now = datetime.now().strftime("%H:%M")
         s, e = qc["start"], qc["end"]
+        if s == e:          # an empty window, not "all day"
+            return False
         return (s <= now < e) if s < e else (now >= s or now < e)
     except (KeyError, TypeError):
         return False
 
 
-def notify(title, message, priority=3, tags=None, actions=None, source="hub", topic=None):
-    """Record + deliver (or hold during quiet hours). Returns the history id."""
+def notify(title, message, priority=3, tags=None, actions=None, source="hub", topic=None, sync=False):
+    """Record + deliver (or hold during quiet hours). Returns the history id.
+    Delivery goes through one queue worker (keeps order); sync=True delivers in this thread (CLI)."""
     cfg = load_config()
     priority = prio(priority)
     tags = [t for t in (tags or []) if t]
@@ -253,11 +259,28 @@ def notify(title, message, priority=3, tags=None, actions=None, source="hub", to
         x("update notifications set status='held' where id=?", (nid,))
         x("insert or replace into held(nid, body) values(?,?)", (nid, json.dumps(body)))
         return nid
-    threading.Thread(target=deliver, args=(nid, body), daemon=True).start()
+    if sync:
+        deliver(nid, body, time.time() + 60)
+    else:
+        _outbox.put((nid, body, time.time() + NTFY_RETRIES * 15))
     return nid
 
 
-def deliver(nid, body):
+_outbox = queue.Queue()   # (history id, ntfy body, give-up time); one worker keeps messages in order
+
+
+def delivery_worker():
+    while True:
+        nid, body, deadline = _outbox.get()
+        try:
+            deliver(nid, body, deadline)
+        except Exception:
+            traceback.print_exc()
+
+
+def deliver(nid, body, deadline):
+    """Send one message, retrying every 15 s until it's accepted or the deadline (counted from when the
+    message was queued, so messages waiting behind it don't each get a fresh 15 minutes) passes."""
     try:
         conf = read_kv(NOTIFY_CONF)
         url = conf["NTFY_URL"].rstrip("/")
@@ -270,7 +293,7 @@ def deliver(nid, body):
         headers["Authorization"] = "Bearer " + conf["NTFY_TOKEN"]
     data = json.dumps(body).encode()
     err = None
-    for attempt in range(max(1, NTFY_RETRIES)):
+    while True:
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=10) as r:
@@ -278,10 +301,15 @@ def deliver(nid, body):
                     x("update notifications set status='sent' where id=?", (nid,))
                     return True
                 err = f"HTTP {r.status}"
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}"
+            if 400 <= e.code < 500 and e.code != 429:   # ntfy rejected this message: retrying won't help
+                break
         except Exception as e:  # ntfy may be restarting
             err = e
-        if attempt + 1 < NTFY_RETRIES:
-            time.sleep(15)
+        if time.time() + 15 > deadline:
+            break
+        time.sleep(15)
     x("update notifications set status=? where id=?", (f"failed: {err}"[:200], nid))
     log("ntfy: giving up:", err, "|", body.get("title"))
     return False
@@ -293,7 +321,7 @@ def flush_held():
     for r in q("select nid, body from held order by nid"):
         x("delete from held where nid=?", (r["nid"],))
         x("update notifications set status='queued' where id=?", (r["nid"],))
-        threading.Thread(target=deliver, args=(r["nid"], json.loads(r["body"])), daemon=True).start()
+        _outbox.put((r["nid"], json.loads(r["body"]), time.time() + NTFY_RETRIES * 15))
 
 
 # ============================================================ docker / updates
@@ -449,9 +477,10 @@ def update_one(name):
     if not ok:
         log(f"{name}: {why} -> rolling back to {old_ver}")
         run(["docker", "image", "tag", old_id, want])
-        back = inspect(name)
-        if back:
-            recreate(back)
+        # recreate from the compose file, not from the container: a failed 'up' may already have removed it
+        rc2, _, err2 = run(ci["base"] + ["up", "-d", "--no-deps", "--force-recreate", ci["service"]], cwd=ci["wd"])
+        if rc2:
+            log(f"{name}: rollback start failed: {tail(err2)}")
         ok2, _ = wait_up(name, need_health=False, timeout=120)
         for d in deps:
             recreate(d)
@@ -491,7 +520,7 @@ def handle_diun(p):
     log(f"diun: status={p.get('status')} image={image}")
     view = [{"action": "view", "label": "Release info", "url": link}] if link.startswith("http") else []
     if "diun/testnotif" in image:
-        notify("Diun test OK", "Diun -> hub -> ntfy is working.", 2, ["white_check_mark"], source="updates")
+        notify("NotifyHub: Diun test OK", "Diun -> NotifyHub -> ntfy is working.", 2, ["white_check_mark"], source="updates")
         return
     names = {cname(d) for d in containers() if norm(d["Config"]["Image"]) == norm(image)}
     for n in str((p.get("metadata") or {}).get("ctn_names") or "").split(","):
@@ -543,7 +572,7 @@ def guard(fn):
             return fn(*a)
         except Exception as e:
             traceback.print_exc()
-            notify("Hub error", f"{getattr(fn, '__name__', 'task')}: {e}", 4, ["warning"])
+            notify("NotifyHub error", f"{getattr(fn, '__name__', 'task')}: {e}", 4, ["warning"])
     return wrapped
 
 
@@ -734,8 +763,24 @@ def items(cfg=None):
     return out
 
 
+_running, _running_lock = set(), threading.Lock()
+
+
 def run_item(kind, name, send=True):
-    """Run one report/check now. Returns {'title','message','priority','tags'} or None, plus an error text."""
+    """Run one report/check now. Returns {'title','message','priority','tags'} or None, plus an error text.
+    The same item never runs twice at once (scheduled run + Preview, or a slow check overlapping itself)."""
+    with _running_lock:
+        if (kind, name) in _running:
+            return None, "already running - try again when the current run finishes"
+        _running.add((kind, name))
+    try:
+        return _run_item(kind, name, send)
+    finally:
+        with _running_lock:
+            _running.discard((kind, name))
+
+
+def _run_item(kind, name, send):
     res, err = None, None
     t0, c0 = time.time(), sum(os.times()[:4])
     try:
@@ -786,7 +831,7 @@ def scheduler():
                     kv_set(key, now)
                     continue
                 try:
-                    if due(it["schedule"], last, now):
+                    if due(it["schedule"], last, now) and (it["kind"], it["name"]) not in _running:
                         kv_set(key, now)
                         threading.Thread(target=run_item, args=(it["kind"], it["name"]), daemon=True).start()
                 except ValueError as e:
@@ -847,13 +892,19 @@ _fails = {}   # ip -> [timestamps]
 
 
 def too_many_fails(ip):
+    """5 failures from one address in 15 min block that address. 25 failures from *outside* addresses block
+    outside logins only, so bots on the internet can never lock you out at home."""
     now = time.time()
     with _fail_lock:
         for k in list(_fails):
             _fails[k] = [t for t in _fails[k] if now - t < 900]
             if not _fails[k]:
                 del _fails[k]
-        return len(_fails.get(ip, [])) >= 5 or sum(len(v) for v in _fails.values()) >= 25
+        if len(_fails.get(ip, [])) >= 5:
+            return True
+        if is_local(ip):
+            return False
+        return sum(len(v) for k, v in _fails.items() if not is_local(k)) >= 25
 
 
 def add_fail(ip):
@@ -861,7 +912,7 @@ def add_fail(ip):
         _fails.setdefault(ip, []).append(time.time())
         n = len(_fails[ip])
     if n == 5:
-        notify("Hub: repeated failed logins", f"5 failed logins from {ip} in 15 minutes; that address is now blocked for a while.",
+        notify("NotifyHub: repeated failed logins", f"5 failed logins from {ip} in 15 minutes; that address is now blocked for a while.",
                4, ["warning", "lock"], source="security")
 
 
@@ -886,12 +937,61 @@ def session_ok(tok):
     return True
 
 
+_net_cache = {"ts": 0, "own": set(), "nets": []}
+
+
+def own_networks():
+    """The server's own addresses and the networks they sit in (refreshed every 10 min; IPv6 prefixes can change)."""
+    if time.time() - _net_cache["ts"] > 600:
+        own, nets = {"127.0.0.1", "::1"}, []
+        rc, out, _ = run(["ip", "-j", "addr"], timeout=10)
+        try:
+            for iface in json.loads(out) if not rc else []:
+                for a in iface.get("addr_info", []):
+                    if a.get("scope") in ("global", "host") and a.get("local"):
+                        own.add(a["local"])
+                        nets.append(ipaddress.ip_network(f"{a['local']}/{a.get('prefixlen', 128)}", strict=False))
+        except (ValueError, KeyError):
+            pass
+        _net_cache.update(ts=time.time(), own=own, nets=nets)
+    return _net_cache["own"], _net_cache["nets"]
+
+
 def is_private(ip):
     try:
         a = ipaddress.ip_address(ip)
         return a.is_private or a.is_loopback
     except ValueError:
         return False
+
+
+def is_local(ip):
+    """Private/loopback, or inside one of this server's own networks (e.g. the home IPv6 /64)."""
+    if is_private(ip):
+        return True
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a.version == n.version and a in n for n in own_networks()[1])
+
+
+def trusted_proxy(peer):
+    """Only these may tell us the visitor's address (X-Real-IP): this server itself (NPM on the host
+    network, or a proxy on localhost) plus anything listed in HUB_TRUSTED_PROXIES (IPs or CIDRs)."""
+    if peer in own_networks()[0]:
+        return True
+    try:
+        a = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    for item in TRUSTED_PROXIES:
+        try:
+            if a in ipaddress.ip_network(item, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 # ============================================================ HTTP
@@ -901,9 +1001,35 @@ CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self'; script-src '
        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
 
+_login_slots = threading.BoundedSemaphore(2)   # scrypt uses ~32 MiB and ~0.1 s CPU per check
+_status_cache = {"ts": 0, "data": None}
+_status_lock = threading.Lock()
+
+
+def overview_status():
+    """Docker + ntfy status for the Overview page, cached 10 s so several open tabs cost the same as one."""
+    with _status_lock:
+        if _status_cache["data"] and time.time() - _status_cache["ts"] < 10:
+            return _status_cache["data"]
+        run_c = containers()
+        try:
+            conf = read_kv(NOTIFY_CONF)
+            with urllib.request.urlopen(conf["NTFY_URL"].rstrip("/") + "/v1/health", timeout=3) as r:
+                ntfy_ok = r.status == 200
+        except Exception:
+            ntfy_ok = False
+        diun = next((c for c in run_c if cname(c) == "diun"), None) or inspect("diun")
+        data = {"containers": len(run_c), "ntfy_ok": ntfy_ok,
+                "unhealthy": [cname(c) for c in run_c if (c["State"].get("Health") or {}).get("Status") == "unhealthy"],
+                "diun": (diun or {}).get("State", {}).get("Status", "missing")}
+        _status_cache.update(ts=time.time(), data=data)
+        return data
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "notify-hub"
     sys_version = ""
+    timeout = 30   # seconds a connection may sit idle/slow before it's dropped (no slowloris thread pile-up)
 
     # ---- plumbing
     @property
@@ -914,7 +1040,7 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def ip(self):
         peer = self.client_address[0]
-        if self.proxied and is_private(peer):
+        if self.proxied and trusted_proxy(peer):
             return (self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For", "").split(",")[0]).strip() or peer
         return peer
 
@@ -1009,6 +1135,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(401, {"error": "login required"})
             try:
                 return self.api_get(path, urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query))
+            except ValueError as e:
+                return self.send_json(400, {"error": str(e)})
             except Exception as e:
                 traceback.print_exc()
                 return self.send_json(500, {"error": str(e)})
@@ -1076,7 +1204,15 @@ class Handler(BaseHTTPRequestHandler):
         pw = (form.get("password") or [""])[0]
         code = (form.get("code") or [""])[0]
         a = load_auth()
-        ok = bool(a) and hmac.compare_digest(user.encode(), a["user"].encode()) and pw_check(a, pw)
+        if not a:
+            return self.redirect("/login?e=1")
+        if not _login_slots.acquire(timeout=5):    # many logins at once: refuse instead of hashing them all
+            return self.redirect("/login?e=busy")
+        try:
+            pw_ok = pw_check(a, pw)                # always hash, so a wrong username takes as long as a right one
+        finally:
+            _login_slots.release()
+        ok = hmac.compare_digest(user.encode(), a["user"].encode()) and pw_ok
         if ok and a.get("totp"):
             ok = totp_check(a["totp"], code)
         if not ok:
@@ -1084,8 +1220,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(1)
             return self.redirect("/login?e=1")
         tok = new_session(ip, self.headers.get("User-Agent"))
-        if not is_private(ip):
-            notify("Hub login", f"New login to the hub from {ip}.", 2, ["key"], source="security")
+        if not is_local(ip):
+            notify("NotifyHub: new login", f"New login to NotifyHub from {ip}.", 2, ["key"], source="security")
         cookie = f"hub_session={tok}; Path=/; Max-Age={SESSION_MAX}; HttpOnly; SameSite=Lax" + ("; Secure" if self.https else "")
         return self.redirect("/", {"Set-Cookie": cookie})
 
@@ -1093,21 +1229,13 @@ class Handler(BaseHTTPRequestHandler):
     def api_get(self, path, qs):
         if path == "/api/overview":
             cfg = load_config()
-            run_c = containers()
-            unhealthy = [cname(c) for c in run_c if ((c["State"].get("Health") or {}).get("Status")) == "unhealthy"]
-            try:
-                conf = read_kv(NOTIFY_CONF)
-                with urllib.request.urlopen(conf["NTFY_URL"].rstrip("/") + "/v1/health", timeout=3) as r:
-                    ntfy_ok = r.status == 200
-            except Exception:
-                ntfy_ok = False
-            diun = inspect("diun")
+            s = overview_status()
             with open("/proc/uptime") as f:
                 up = float(f.read().split()[0])
             return self.send_json(200, {
-                "host": os.uname().nodename, "uptime": up, "ntfy_ok": ntfy_ok,
-                "diun": (diun or {}).get("State", {}).get("Status", "missing"), "diun_schedule": diun_schedule(),
-                "containers": len(run_c), "unhealthy": unhealthy,
+                "host": os.uname().nodename, "uptime": up, "ntfy_ok": s["ntfy_ok"],
+                "diun": s["diun"], "diun_schedule": diun_schedule(),
+                "containers": s["containers"], "unhealthy": s["unhealthy"],
                 "pending": len(q("select token from pending")), "held": len(q("select nid from held")),
                 "quiet": cfg["quiet"], "quiet_now": quiet_now(cfg),
                 "recent": q("select * from notifications order by id desc limit 15"),
@@ -1226,10 +1354,18 @@ class Handler(BaseHTTPRequestHandler):
             save_config(cfg)
             return self.send_json(200, {"ok": True})
         if path == "/api/items/run":
-            res, err = run_item(d.get("kind"), str(d.get("name", "")), send=bool(d.get("send")))
+            # run in the background and wait up to 50 s, so slow checks don't hit the reverse proxy's timeout
+            box = {}
+            t = threading.Thread(target=lambda: box.update(r=run_item(d.get("kind"), str(d.get("name", "")),
+                                                                      send=bool(d.get("send")))), daemon=True)
+            t.start()
+            t.join(50)
+            if "r" not in box:
+                return self.send_json(200, {"result": None, "error": "still running - its result will show under Last run"})
+            res, err = box["r"]
             return self.send_json(200, {"result": res, "error": err})
         if path == "/api/test":
-            notify("Test from the hub", "If you can read this, the hub can reach your phone.", 3, ["wave"], source="hub")
+            notify("NotifyHub test", "If you can read this, NotifyHub can reach your phone.", 3, ["wave"], source="hub")
             return self.send_json(200, {"ok": True})
         if path == "/api/settings":
             if "public_url" in d:
@@ -1267,6 +1403,9 @@ class Handler(BaseHTTPRequestHandler):
             salt = secrets.token_bytes(16)
             a.update({"salt": salt.hex(), "hash": pw_hash(new, salt)})
             save_auth(a)
+            # sign out every other device; keep this one
+            cur = hashlib.sha256((self.cookie("hub_session") or "").encode()).hexdigest()
+            x("delete from sessions where id <> ?", (cur,))
             return self.send_json(200, {"ok": True})
         if path == "/api/logout-all":
             x("delete from sessions")
@@ -1344,8 +1483,7 @@ def cli(argv):
         x("delete from sessions")
         print("All sessions signed out.")
     elif cmd == "send" and len(argv) >= 3:
-        nid = notify(argv[1], argv[2], argv[3] if len(argv) > 3 else 3, source="cli")
-        time.sleep(3)
+        nid = notify(argv[1], argv[2], argv[3] if len(argv) > 3 else 3, source="cli", sync=True)
         print("status:", q("select status from notifications where id=?", (nid,))[0]["status"])
     else:
         print(__doc__)
@@ -1361,6 +1499,7 @@ if __name__ == "__main__":
         raise SystemExit(f"secret in {SECRET_FILE} is missing/too short")
     db()
     migrate_old_policy()
+    threading.Thread(target=delivery_worker, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
     log(f"notify-hub listening on :{PORT}, public url {public_base()}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
