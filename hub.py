@@ -1052,7 +1052,7 @@ class Handler(BaseHTTPRequestHandler):
                 tok = self.cookie("hub_session")
                 if tok:
                     x("delete from sessions where id=?", (hashlib.sha256(tok.encode()).hexdigest(),))
-                return self.redirect("/login", {"Set-Cookie": "hub_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"})
+                return self.redirect("/login", {"Set-Cookie": "hub_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"})
             if path.startswith("/api/"):
                 if not self.authed:
                     return self.send_json(401, {"error": "login required"})
@@ -1086,7 +1086,7 @@ class Handler(BaseHTTPRequestHandler):
         tok = new_session(ip, self.headers.get("User-Agent"))
         if not is_private(ip):
             notify("Hub login", f"New login to the hub from {ip}.", 2, ["key"], source="security")
-        cookie = f"hub_session={tok}; Path=/; Max-Age={SESSION_MAX}; HttpOnly; SameSite=Strict" + ("; Secure" if self.https else "")
+        cookie = f"hub_session={tok}; Path=/; Max-Age={SESSION_MAX}; HttpOnly; SameSite=Lax" + ("; Secure" if self.https else "")
         return self.redirect("/", {"Set-Cookie": cookie})
 
     # ---- API: reads

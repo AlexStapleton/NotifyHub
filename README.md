@@ -108,7 +108,7 @@ How it protects itself:
   - optional TOTP
   - 5 failed logins per IP (or 25 in total) within 15 minutes lock out further tries
   - a notification on every login from outside your LAN
-- **Sessions:** HttpOnly, SameSite=Strict, and Secure behind HTTPS cookies. They expire after 7 days idle or 30 days at most.
+- **Sessions:** HttpOnly, SameSite=Lax (so links from other pages keep you signed in), and Secure behind HTTPS cookies. They expire after 7 days idle or 30 days at most.
 - **Requests:**
   - Every change needs a custom request header, so other sites can't trigger actions.
   - A strict Content-Security-Policy is set, and nothing is loaded from other sites.
