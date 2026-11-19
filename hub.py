@@ -668,6 +668,7 @@ def find_outdated():
         if info and info.get("digest") and info["digest"] not in mine:
             cur = running_ver.get(c["Image"], "")
             found.append({"name": cname(c), "image": ref, "latest": info["digest"], "compose": compose_info(c) is not None,
+                          "container_id": c["Id"], "image_id": c["Image"],
                           "running_version": cur, "latest_version": info.get("version", ""), "built": info.get("built", ""),
                           "change": describe_change([cur], info)})
     return found
@@ -1415,7 +1416,19 @@ class Handler(BaseHTTPRequestHandler):
                             "policy": pol.get(n), "default_policy": pol.get("*", "ask"),
                             "compose": compose_info(c) is not None, "last_update": last.get(n), "pending": pend.get(n)})
             av = kv_get("available") or {"ts": None, "items": []}
-            avail = {i["name"] for i in av["items"]}
+            # drop entries whose container was recreated or re-imaged since the check (e.g. updated by hand),
+            # and read the compose status live rather than from the check
+            live = {cname(c): c for c in cs}
+            fresh = []
+            for i in av["items"]:
+                c = live.get(i["name"])
+                if not c or c.get("State", {}).get("Status") != "running":
+                    continue
+                if i.get("container_id") and (c["Id"] != i["container_id"] or c["Image"] != i.get("image_id")):
+                    continue
+                fresh.append(dict(i, compose=compose_info(c) is not None))
+            av = {"ts": av["ts"], "items": fresh}
+            avail = {i["name"] for i in fresh}
             for r in out:
                 r["update_available"] = r["name"] in avail
             out.sort(key=lambda r: (r["state"] != "running", not r["update_available"], r["name"]))
@@ -1658,6 +1671,7 @@ if __name__ == "__main__":
         raise SystemExit(f"secret in {SECRET_FILE} is missing/too short")
     db()
     migrate_old_policy()
+    kv_set("last_reconcile", 0)   # refresh the "out of date" list shortly after every start (announces only new things)
     threading.Thread(target=delivery_worker, daemon=True).start()
     threading.Thread(target=scheduler, daemon=True).start()
     log(f"notify-hub listening on :{PORT}, public url {public_base()}")
