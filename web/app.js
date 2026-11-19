@@ -142,7 +142,9 @@ async function updates() {
         el("button", { class: "ghost sm", onclick: async (e) => { e.target.disabled = true; const r = await api("/api/check-updates", {}); toast(r.message); } }, "Check now"))),
     el("div", { class: "card" }, c.available.length ? el("ul", { class: "feed" }, c.available.map(a => el("li", {}, el("span", { class: "p p4" }),
       el("div", { class: "row spread" },
-        el("div", {}, el("div", { class: "t" }, a.name), el("div", { class: "m" }, `newer image available: ${a.image}`)),
+        el("div", {}, el("div", { class: "t" }, a.name),
+          el("div", { class: "m" }, a.image + (a.running_version ? ` · running ${a.running_version}` : "")),
+          a.change ? el("div", { class: "m" }, a.change) : null),
         a.compose ? el("button", { onclick: (e) => updateNow(a.name, e.target) }, "Update now")
                   : el("span", { class: "muted small" }, "not from a compose file - update by hand")))))
       : el("p", { class: "muted" }, c.checked ? "Everything is up to date." : "Not checked yet - press Check now.")),

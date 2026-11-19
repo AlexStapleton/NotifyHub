@@ -537,8 +537,9 @@ def handle_diun(p):
     announce(image, sorted(names), view, p.get("digest"))
 
 
-def announce(image, names, view=None, digest=None):
+def announce(image, names, view=None, digest=None, info=None):
     """Act on 'a newer image exists' for these containers, per their policy (auto / ask / notify / ignore)."""
+    info = info if info is not None else diun_info(image)
     pol = load_config()["policies"]
     groups = {k: [] for k in POLICIES}
     for n in sorted(names):
@@ -553,11 +554,15 @@ def announce(image, names, view=None, digest=None):
         threading.Thread(target=guard(do_updates), args=(groups["auto"], "auto"), daemon=True).start()
 
     def desc(ns):
-        out = []
+        out, vers = [], []
         for n in ns:
             c = inspect(n)
-            out.append(f"{n} ({image_version(c['Image']) if c else '?'})")
-        return ", ".join(out)
+            img = inspect(c["Image"], "image") if c else None
+            v = label_version(((img or {}).get("Config") or {}).get("Labels"))
+            vers.append(v)
+            out.append(f"{n} ({v or (c['Image'][7:19] if c else '?')})")
+        change = describe_change(vers, info)
+        return ", ".join(out) + (f"\n{change}" if change else "")
 
     hub_view = [{"action": "view", "label": "Open hub", "url": public_base() + "/#updates"}]
     if groups["ask"]:
@@ -591,8 +596,19 @@ def guard(fn):
 
 
 # ------------------------------------------------------------ update tracking (Diun's database vs what runs)
-def diun_latest(ref):
-    """Newest digest Diun has seen in the registry for this image:tag (no registry call of our own)."""
+VERSION_LABELS = ("org.opencontainers.image.version", "org.label-schema.version", "version")
+
+
+def label_version(labels):
+    for k in VERSION_LABELS:
+        if (labels or {}).get(k):
+            return str(labels[k])
+    return ""
+
+
+def diun_info(ref):
+    """Newest image Diun has seen in the registry for this image:tag: {digest, version, built}
+    (read from Diun's database - no registry call of our own)."""
     n = norm(ref)
     tag = n.rsplit(":", 1)[1]
     rc, out, _ = run(["docker", "exec", "diun", "diun", "image", "inspect", "--image", n, "--raw"], timeout=30)
@@ -601,10 +617,28 @@ def diun_latest(ref):
     try:
         for m in json.loads(out).get("image", {}).get("manifests", []):
             if m.get("tag") == tag:
-                return m.get("digest")
+                return {"digest": m.get("digest"), "version": label_version(m.get("labels")),
+                        "built": (m.get("created") or "")[:10]}
     except ValueError:
         pass
     return None
+
+
+def diun_latest(ref):
+    return (diun_info(ref) or {}).get("digest")
+
+
+def describe_change(running_versions, info):
+    """One line saying whether this is a new version or the same version rebuilt."""
+    if not info:
+        return ""
+    new, built = info.get("version"), info.get("built")
+    when = f" on {built}" if built else ""
+    if new and running_versions and all(v == new for v in running_versions):
+        return f"Same version ({new}), rebuilt{when} - usually operating-system/security fixes inside the image."
+    if new:
+        return f"Newest version: {new} (built{when or ' recently'})."
+    return f"Newer image built{when or ' recently'} (the image has no version label)."
 
 
 def find_outdated():
@@ -613,11 +647,13 @@ def find_outdated():
     cs = containers()
     ids = sorted({c["Image"] for c in cs})
     local = {}
+    running_ver = {}
     if ids:
         rc, out, _ = run(["docker", "image", "inspect"] + ids, timeout=60)
         try:
             for img in json.loads(out) if not rc else []:
                 local[img["Id"]] = {d.split("@", 1)[1] for d in (img.get("RepoDigests") or []) if "@" in d}
+                running_ver[img["Id"]] = label_version((img.get("Config") or {}).get("Labels"))
         except ValueError:
             pass
     latest, found = {}, []
@@ -627,9 +663,13 @@ def find_outdated():
             continue
         ref = norm(c["Config"]["Image"])
         if ref not in latest:
-            latest[ref] = diun_latest(ref)
-        if latest[ref] and latest[ref] not in mine:
-            found.append({"name": cname(c), "image": ref, "latest": latest[ref], "compose": compose_info(c) is not None})
+            latest[ref] = diun_info(ref)
+        info = latest[ref]
+        if info and info.get("digest") and info["digest"] not in mine:
+            cur = running_ver.get(c["Image"], "")
+            found.append({"name": cname(c), "image": ref, "latest": info["digest"], "compose": compose_info(c) is not None,
+                          "running_version": cur, "latest_version": info.get("version", ""), "built": info.get("built", ""),
+                          "change": describe_change([cur], info)})
     return found
 
 
@@ -646,15 +686,16 @@ def reconcile(manual=False):
         kv_set("available", {"ts": time.time(), "items": found})
         ann = kv_get("announced", {})
         pending = {n for r in q("select containers from pending") for n in json.loads(r["containers"])}
-        by_image = {}
+        by_image, infos = {}, {}
         for f in found:
             if f["name"] in pending and not manual:
                 continue
             if not manual and ann.get(f["name"]) == f["latest"]:
                 continue
             by_image.setdefault((f["image"], f["latest"]), []).append(f["name"])
-        for (image, digest), names in by_image.items():
-            announce(image, names, None, digest)
+            infos[(f["image"], f["latest"])] = {"digest": f["latest"], "version": f["latest_version"], "built": f["built"]}
+        for key, names in by_image.items():
+            announce(key[0], names, None, key[1], infos[key])
         log(f"update check: {len(found)} out of date, announced {sum(len(v) for v in by_image.values())}"
             + (" (manual)" if manual else ""))
         kv_set("last_reconcile", time.time())
