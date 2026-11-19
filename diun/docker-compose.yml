@@ -1,0 +1,16 @@
+# Diun - checks daily whether newer images exist for running containers and tells NotifyHub.
+# Setup: see README ("Container updates with Diun"). `sudo ./install.sh --diun <folder>` generates diun.yml.
+services:
+  diun:
+    image: crazymax/diun:latest
+    container_name: diun
+    command: ["serve", "--config", "/diun.yml"]
+    environment:
+      - TZ=${TZ:-UTC}          # put TZ=Your/Zone in a .env file next to this one
+      - LOG_LEVEL=info
+      - LOG_NOCOLOR=true
+    volumes:
+      - ./data:/data
+      - ./diun.yml:/diun.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped

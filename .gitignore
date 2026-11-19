@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+config.json
+diun.secret
+*.db
+.env

@@ -1,0 +1,18 @@
+[Unit]
+Description=NotifyHub (notifications, container updates, reports, web UI)
+After=docker.service network-online.target
+Wants=docker.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/notify/hub/hub.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/root
+# keep retrying ntfy for 15 min (60 x 15 s), same as the notify script
+Environment=HUB_NTFY_RETRIES=60
+# site-specific settings (HUB_LAN_URL, HUB_DIUN_YML, HUB_PORT, ...), written by install.sh
+EnvironmentFile=-/etc/default/notify-hub
+
+[Install]
+WantedBy=multi-user.target

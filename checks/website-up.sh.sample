@@ -1,0 +1,8 @@
+#!/bin/sh
+# Alert when a website stops answering. Copy to website-up.sh, chmod 755, edit URL.
+URL="https://example.com/"
+code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$URL")
+case "$code" in
+  2*|3*|401) exit 0 ;;
+  *) echo "title: $URL is down"; echo "It answered HTTP $code (000 = no answer)."; exit 1 ;;
+esac

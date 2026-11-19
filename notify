@@ -1,0 +1,31 @@
+#!/bin/sh
+# notify - send a push notification from anything on this server.
+# Usage: notify [-t topic] [-p priority 1-5|min|low|default|high|urgent] [-g tag1,tag2] "Title" "Message"
+# Goes through notify-hub (history, quiet hours, web UI at :8099). If the hub isn't running (e.g. early at boot)
+# it sends straight to ntfy instead, retrying in the background for up to 15 min.
+# Always logs to the journal too:  journalctl -t notify
+. /home/notify/notify.conf
+TOPIC="$NTFY_TOPIC"; PRIO=default; TAGS=""
+while getopts "t:p:g:" o; do case "$o" in t) TOPIC="$OPTARG";; p) PRIO="$OPTARG";; g) TAGS="$OPTARG";; *) exit 2;; esac; done
+shift $((OPTIND-1))
+TITLE="${1:-$(hostname)}"; MSG="${2:-(no message)}"
+logger -t notify -p daemon.notice "[$TOPIC/$PRIO] $TITLE: $MSG"
+via_hub() {
+  set -- -fsS -m 5 -o /dev/null -H "Title: $TITLE" -H "Priority: $PRIO" -H "X-Source: ${NOTIFY_SOURCE:-notify}"
+  [ -n "$TAGS" ] && set -- "$@" -H "Tags: $TAGS"
+  [ "$TOPIC" != "$NTFY_TOPIC" ] && set -- "$@" -H "X-Topic: $TOPIC"
+  printf '%s' "$MSG" | curl "$@" --data-binary @- http://127.0.0.1:8099/api/notify >/dev/null 2>&1
+}
+send() {
+  set -- -fsS -m 15 -H "Title: $TITLE" -H "Priority: $PRIO"
+  [ -n "$TAGS" ] && set -- "$@" -H "Tags: $TAGS"
+  [ -n "${NTFY_TOKEN:-}" ] && set -- "$@" -H "Authorization: Bearer $NTFY_TOKEN"
+  curl "$@" -d "$MSG" "$NTFY_URL/$TOPIC" >/dev/null 2>&1
+}
+via_hub && exit 0
+send && exit 0
+logger -t notify -p daemon.warning "ntfy unreachable, retrying in background for: $TITLE"
+export TITLE MSG PRIO TAGS TOPIC NTFY_URL NTFY_TOKEN
+( i=0; while [ $i -lt 30 ]; do sleep 30; i=$((i+1)); if send; then logger -t notify "delivered after retry $i: $TITLE"; exit 0; fi; done
+  logger -t notify -p daemon.err "ntfy delivery failed after 15 min for: $TITLE" ) >/dev/null 2>&1 &
+exit 0

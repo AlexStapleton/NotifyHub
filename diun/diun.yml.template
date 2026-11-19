@@ -1,0 +1,24 @@
+# Diun config. install.sh --diun fills in __HUB_URL__ and __SECRET__ (the real file is root-only: it holds the secret).
+db:
+  path: /data/diun.db
+
+watch:
+  workers: 10
+  schedule: "0 9 * * *"      # every day 09:00 in the container's TZ; editable from the hub's Settings page
+  jitter: 30s
+  firstCheckNotif: false     # don't report every image on the very first run
+  runOnStartup: true
+
+providers:
+  docker:
+    watchByDefault: true     # all running containers
+    watchStopped: false
+
+notif:
+  webhook:
+    endpoint: __HUB_URL__/diun
+    method: POST
+    headers:
+      content-type: application/json
+      authorization: Bearer __SECRET__
+    timeout: 10s

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · NotifyHub</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body class="center">
+<form class="card login" method="post" action="/api/login" autocomplete="on">
+  <div class="brand big"><img src="/favicon.svg" alt=""><span>NotifyHub</span></div>
+  <p id="err" class="err" hidden></p>
+  <label>Username<input name="user" autocomplete="username" required autofocus></label>
+  <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+  <label>2-factor code <span class="muted">(if turned on)</span><input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]*"></label>
+  <button type="submit">Sign in</button>
+</form>
+<script src="/app.js"></script>
+</body>
+</html>
